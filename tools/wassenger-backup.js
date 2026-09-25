@@ -3,31 +3,40 @@
  * wassenger-backup.js — dump every chat (and optionally every media file)
  * from a Wassenger device to local JSON + plain-text transcripts.
  *
- * Zero dependencies. Needs Node 18+ (built-in fetch).
+ * Zero dependencies. Needs Node 18+ (built-in fetch). On Node 22+ behind an
+ * HTTPS proxy, run with NODE_USE_ENV_PROXY=1.
  *
  * Usage:
  *   WASSENGER_API_KEY=xxx WASSENGER_DEVICE_ID=yyy node wassenger-backup.js [options]
  *
  *   --out <dir>       output directory (default ./wassenger-backup)
  *   --media           also download images / voice notes / documents
- *   --since <date>    only chats whose last message is on/after this date (YYYY-MM-DD)
- *   --force           re-download chats that look unchanged since last run
- *   --page-size <n>   API page size, max 100 (default 100)
+ *   --only <phones>   comma-separated phone numbers (digits, no +) to back up
+ *                     instead of every chat; handy for testing one contact
+ *   --force           re-download media files that already exist
+ *   --debug           log every API response status/shape to stderr
  *
  * If you run it inside the wassenger-agent folder (which already has a .env
  * with the key and device id), just do:
  *   node -r dotenv/config tools/wassenger-backup.js --media
  *
  * Output layout:
- *   <out>/index.json                 one line per chat: phone, name, labels, counts
- *   <out>/chats/<phone>.json         { chat, messages[] } raw API objects
+ *   <out>/index.json                 summary + one entry per chat
+ *   <out>/chats/<phone>.json         { summary, chat, messages[] } raw API objects
  *   <out>/chats/<phone>.txt          human-readable transcript
  *   <out>/media/<phone>/<msgId>.<ext> media files (with --media)
  *
- * Endpoints used (same ones the wassenger-agent bot uses in production):
- *   GET /chat/{device}/chats?size=&page=
- *   GET /chat/{device}/messages?chat=&size=&page=&order=asc
- *   GET /chat/{device}/files/{fileId}/download
+ * Strategy (verified against the live API, Sep 2026):
+ *   - GET /chat/{device}/messages?size=50&page=N with NO chat filter walks the
+ *     whole device message stream. Grouping by message.chat.id is the only
+ *     source that is guaranteed complete: the chats list endpoint paginates
+ *     inconsistently and silently omitted active chats in testing.
+ *   - GET /chat/{device}/chats (default and archived=true) supplies names and
+ *     labels; anything still missing is fetched with GET /chat/{device}/chats/{wid}.
+ *   - GET /chat/{device}/files/{fileId}/download fetches media bytes.
+ *   - `size` is capped at 50 by the API and `page` is ZERO-indexed. The `order`
+ *     query param breaks the chat filter, so it is never sent; ordering is done
+ *     locally.
  */
 
 'use strict';
@@ -52,12 +61,17 @@ function opt(name, def) {
 const OUT_DIR = path.resolve(opt('--out', './wassenger-backup'));
 const WITH_MEDIA = flag('--media');
 const FORCE = flag('--force');
-const PAGE_SIZE = Math.min(100, Number(opt('--page-size', 100)) || 100);
-const SINCE = opt('--since', null) ? Date.parse(opt('--since')) : null;
+const DEBUG = flag('--debug');
+const ONLY = (opt('--only', '') || '').split(',').map((s) => s.replace(/[^\d]/g, '')).filter(Boolean);
+const PAGE_SIZE = 50; // API maximum
 
 if (!API_KEY || !DEVICE_ID) {
   console.error('Set WASSENGER_API_KEY and WASSENGER_DEVICE_ID in the environment.');
   process.exit(1);
+}
+
+function dbg(...parts) {
+  if (DEBUG) console.error('[debug]', ...parts);
 }
 
 // ---------------------------------------------------------------------------
@@ -77,18 +91,27 @@ async function api(pathname, query = {}, { raw = false } = {}) {
       const res = await fetch(url, { headers: { Authorization: API_KEY } });
       if (res.status === 429 || res.status >= 500) {
         lastErr = new Error(`${res.status} ${res.statusText} on ${pathname}`);
+        dbg(res.status, pathname, url.search, 'retrying');
         if (attempt < backoffs.length) { await sleep(backoffs[attempt]); continue; }
         throw lastErr;
       }
       if (!res.ok) {
         const text = await res.text();
+        dbg(res.status, pathname, url.search, '->', text.slice(0, 300));
         const err = new Error(`${res.status} ${res.statusText} on ${pathname}: ${text.slice(0, 200)}`);
         err.status = res.status;
         throw err;
       }
       if (raw) return res;
       const text = await res.text();
-      return text ? JSON.parse(text) : null;
+      const parsed = text ? JSON.parse(text) : null;
+      if (DEBUG) {
+        const shape = Array.isArray(parsed)
+          ? `array(${parsed.length})`
+          : parsed && typeof parsed === 'object' ? `object keys=${Object.keys(parsed).slice(0, 12).join(',')}` : typeof parsed;
+        dbg(res.status, pathname, url.search, '->', shape);
+      }
+      return parsed;
     } catch (err) {
       if (err.status && err.status < 500 && err.status !== 429) throw err;
       lastErr = err;
@@ -104,125 +127,145 @@ function asList(data) {
 }
 
 // ---------------------------------------------------------------------------
-// Normalisers (tolerant of the field-name drift Wassenger has had over time)
+// Normalisers
 // ---------------------------------------------------------------------------
-function chatKey(c) {
-  const wid = c.wid || c.id || c.chat?.id || c.contact?.wid || '';
-  const phone = (c.phone || c.contact?.phone || wid).toString().replace(/@.*$/, '').replace(/^\+/, '');
-  return { wid: wid || `${phone}@c.us`, phone: phone || wid };
+function phoneOf(wid) {
+  return String(wid || '').replace(/@.*$/, '').replace(/^\+/, '');
+}
+
+function msgChatId(m) {
+  return m.chat?.id || m.chat?.wid || (typeof m.chat === 'string' ? m.chat : null)
+    || (m.flow === 'outbound' ? m.to : m.from) || null;
 }
 
 function msgTs(m) {
-  const t = m.timestamp ?? m.date ?? m.createdAt ?? m.t ?? null;
+  const t = m.date ?? m.timestamp ?? m.createdAt ?? null;
   if (t == null) return null;
   if (typeof t === 'number') return t < 1e12 ? t * 1000 : t;
   const p = Date.parse(t);
   return Number.isNaN(p) ? null : p;
 }
 
-function chatLastTs(c) {
-  const lm = c.lastMessage || c.last_message || c.preview || null;
-  return msgTs({ timestamp: c.lastMessageAt ?? c.lastMessageTime ?? lm?.timestamp ?? lm?.date ?? c.updatedAt ?? null });
-}
-
 function msgBody(m) {
-  return m.body || m.message || m.text || m.caption || '';
+  return m.body || m.message || m.text || m.media?.caption || '';
 }
 
 function msgFromMe(m) {
-  return Boolean(m.fromMe ?? m.outbound ?? m.me ?? m.flow === 'outbound');
+  if (m.flow) return m.flow === 'outbound';
+  return Boolean(m.fromMe ?? m.outbound ?? m.me);
 }
 
 function msgMedia(m) {
-  const media = m.media || m.file || m.attachment || null;
-  if (!media) return null;
-  const id = media.id || media.fileId || media._id || null;
-  const link = media.links?.download || media.url || media.download || null;
-  if (!id && !link) return null;
-  const mime = media.mime || media.mimetype || media.type || null;
-  return { id, link, mime, filename: media.filename || media.name || null };
+  const media = m.media || null;
+  if (!media || !(media.id || media.links?.download)) return null;
+  return {
+    id: media.id || null,
+    link: media.links?.download || null,
+    mime: media.mime || null,
+    ext: media.extension ? `.${media.extension.replace(/^\./, '')}` : null,
+    filename: media.filename || null,
+    size: media.size || null,
+    expiresAt: media.expiresAt || null,
+  };
 }
 
-function extFor(mime, filename) {
-  if (filename && path.extname(filename)) return path.extname(filename);
+function extFor(media) {
+  if (media.ext) return media.ext;
+  if (media.filename && path.extname(media.filename)) return path.extname(media.filename);
   const map = {
     'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'image/gif': '.gif',
-    'video/mp4': '.mp4', 'audio/ogg': '.ogg', 'audio/ogg; codecs=opus': '.ogg', 'audio/mpeg': '.mp3',
-    'application/pdf': '.pdf',
+    'video/mp4': '.mp4', 'audio/ogg': '.ogg', 'audio/mpeg': '.mp3', 'application/pdf': '.pdf',
   };
-  return map[(mime || '').toLowerCase()] || '.bin';
+  return map[(media.mime || '').toLowerCase().split(';')[0]] || '.bin';
+}
+
+function chatName(c) {
+  return c?.contact?.name || c?.contact?.displayName || c?.name || null;
+}
+
+function chatLabels(c) {
+  return (c?.labels || []).map((l) => (typeof l === 'string' ? l : l?.name)).filter(Boolean);
 }
 
 // ---------------------------------------------------------------------------
 // Fetchers
 // ---------------------------------------------------------------------------
-async function listAllChats() {
+
+/** Walk the entire device message stream (or one chat's) and return all messages. */
+async function walkMessages(filter = {}) {
   const out = [];
   const seen = new Set();
-  for (let page = 1; ; page++) {
-    const data = await api(`/chat/${DEVICE_ID}/chats`, { size: PAGE_SIZE, page, order: 'desc' });
-    const list = asList(data);
+  let stalePages = 0;
+  for (let page = 0; ; page++) { // pages are zero-indexed
+    let list;
+    try {
+      list = asList(await api(`/chat/${DEVICE_ID}/messages`, { size: PAGE_SIZE, page, ...filter }));
+    } catch (err) {
+      if (err.status === 400 && page > 0) break; // page beyond the API's range
+      throw err;
+    }
     if (!list.length) break;
     let added = 0;
-    for (const c of list) {
-      const { wid } = chatKey(c);
-      if (!wid || seen.has(wid)) continue;
-      seen.add(wid);
-      out.push(c);
+    for (const m of list) {
+      const id = m.id || m.wid || `${msgTs(m)}-${msgChatId(m)}-${msgBody(m).slice(0, 20)}`;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      out.push(m);
       added++;
     }
-    process.stderr.write(`\rchats: ${out.length}`);
-    if (added === 0 || list.length < PAGE_SIZE) break;
-    await sleep(200);
+    if (!filter.chat) process.stderr.write(`\rmessages: ${out.length} (page ${page})`);
+    if (added === 0) { if (++stalePages >= 2) break; } else stalePages = 0;
+    if (list.length < PAGE_SIZE) break;
+    await sleep(150);
   }
-  process.stderr.write('\n');
+  if (!filter.chat) process.stderr.write('\n');
   return out;
 }
 
-async function listAllMessages(wid, phone) {
-  const out = [];
-  const seen = new Set();
-  // Wassenger's messages endpoint has accepted `chat` as either the WID or the
-  // bare phone across versions; try WID first, fall back to phone.
-  const chatParams = [wid, phone];
-  for (const chat of chatParams) {
-    out.length = 0; seen.clear();
-    let ok = false;
-    for (let page = 1; ; page++) {
-      let data;
+/** Pull chat metadata (names, labels, status) from both list views. */
+async function fetchChatMetadata() {
+  const byWid = new Map();
+  for (const extra of [{}, { archived: true }]) {
+    for (let page = 0; ; page++) { // pages are zero-indexed
+      let list;
       try {
-        data = await api(`/chat/${DEVICE_ID}/messages`, { chat, size: PAGE_SIZE, page, order: 'asc' });
+        list = asList(await api(`/chat/${DEVICE_ID}/chats`, { size: PAGE_SIZE, page, ...extra }));
       } catch (err) {
-        if (err.status === 400 || err.status === 404) break; // try next param shape
+        if (err.status === 400 && page > 0) break;
         throw err;
       }
-      ok = true;
-      const list = asList(data);
       if (!list.length) break;
       let added = 0;
-      for (const m of list) {
-        const id = m.id || m._id || m.wid || `${msgTs(m)}-${msgBody(m).slice(0, 20)}`;
-        if (seen.has(id)) continue;
-        seen.add(id);
-        out.push(m);
+      for (const c of list) {
+        const wid = c.id || c.wid || c.contact?.wid;
+        if (!wid) continue;
+        // Prefer the @c.us record over the @lid alias for the same contact.
+        const existing = byWid.get(wid);
+        if (!existing || (wid.endsWith('@c.us') && !existing.id?.endsWith('@c.us'))) byWid.set(wid, c);
         added++;
       }
+      process.stderr.write(`\rchat metadata: ${byWid.size}`);
       if (added === 0 || list.length < PAGE_SIZE) break;
-      await sleep(200);
+      await sleep(150);
     }
-    if (ok) break;
   }
-  out.sort((a, b) => (msgTs(a) || 0) - (msgTs(b) || 0));
-  return out;
+  process.stderr.write('\n');
+  return byWid;
+}
+
+async function fetchOneChat(wid) {
+  try {
+    return await api(`/chat/${DEVICE_ID}/chats/${encodeURIComponent(wid)}`);
+  } catch (err) {
+    if (err.status === 404) return null;
+    throw err;
+  }
 }
 
 async function downloadMedia(media, dest) {
-  const target = media.id
-    ? `/chat/${DEVICE_ID}/files/${encodeURIComponent(media.id)}/download`
-    : null;
   let res;
-  if (target) {
-    res = await api(target, {}, { raw: true });
+  if (media.id) {
+    res = await api(`/chat/${DEVICE_ID}/files/${encodeURIComponent(media.id)}/download`, {}, { raw: true });
   } else {
     const abs = /^https?:/i.test(media.link) ? media.link : new URL(API_BASE).origin + media.link;
     res = await fetch(abs, { headers: { Authorization: API_KEY } });
@@ -236,16 +279,19 @@ async function downloadMedia(media, dest) {
 // ---------------------------------------------------------------------------
 // Writers
 // ---------------------------------------------------------------------------
-function transcript(chat, messages) {
-  const name = chat.name || chat.contact?.name || chat.pushName || '';
-  const lines = [`# ${name} (${chatKey(chat).phone})`, ''];
+function transcript(name, phone, messages, mediaPaths) {
+  const lines = [`# ${name || '(no name)'} (+${phone})`, ''];
   for (const m of messages) {
     const ts = msgTs(m);
     const when = ts ? new Date(ts).toISOString().replace('T', ' ').slice(0, 19) : '????-??-?? ??:??:??';
     const who = msgFromMe(m) ? 'ME  ' : 'THEM';
     const media = msgMedia(m);
-    const body = msgBody(m).replace(/\r?\n/g, '\n            ');
-    lines.push(`${when} ${who} ${media ? `[${m.type || 'media'}${media.filename ? ' ' + media.filename : ''}] ` : ''}${body}`);
+    const saved = mediaPaths.get(m.id);
+    const tag = media
+      ? `[${m.type || 'media'}${media.filename ? ' ' + media.filename : ''}${saved ? ' -> ' + saved : ''}] `
+      : (m.type && m.type !== 'text' && m.type !== 'chat' ? `[${m.type}] ` : '');
+    const body = msgBody(m).replace(/\r?\n/g, '\n                          ');
+    lines.push(`${when} ${who} ${tag}${body}`);
   }
   return lines.join('\n') + '\n';
 }
@@ -258,94 +304,123 @@ function transcript(chat, messages) {
   if (WITH_MEDIA) fs.mkdirSync(path.join(OUT_DIR, 'media'), { recursive: true });
 
   console.log(`Backing up device ${DEVICE_ID} to ${OUT_DIR}${WITH_MEDIA ? ' (with media)' : ''}`);
-  const chats = await listAllChats();
-  console.log(`Found ${chats.length} chats`);
 
-  const index = [];
-  let done = 0, skipped = 0, mediaFiles = 0, mediaBytes = 0, errors = 0;
-
-  for (const chat of chats) {
-    const { wid, phone } = chatKey(chat);
-    const lastTs = chatLastTs(chat);
-    const jsonPath = path.join(OUT_DIR, 'chats', `${phone}.json`);
-    const txtPath = path.join(OUT_DIR, 'chats', `${phone}.txt`);
-
-    if (SINCE && lastTs && lastTs < SINCE) { skipped++; continue; }
-
-    // Resume: skip if we already have this chat and its last message hasn't moved.
-    if (!FORCE && fs.existsSync(jsonPath)) {
-      try {
-        const prev = JSON.parse(fs.readFileSync(jsonPath, 'utf-8'));
-        if (prev.lastTs && lastTs && prev.lastTs === lastTs) {
-          index.push(prev.summary);
-          skipped++;
-          continue;
-        }
-      } catch { /* fall through and re-download */ }
+  // 1. Messages, grouped by chat.
+  const byChat = new Map(); // wid -> messages[]
+  if (ONLY.length) {
+    console.log(`Targeted run for ${ONLY.length} chat(s): ${ONLY.join(', ')}`);
+    for (const phone of ONLY) {
+      const msgs = await walkMessages({ chat: phone });
+      byChat.set(`${phone}@c.us`, msgs);
     }
+  } else {
+    const all = await walkMessages();
+    for (const m of all) {
+      const wid = msgChatId(m);
+      if (!wid) continue;
+      if (!byChat.has(wid)) byChat.set(wid, []);
+      byChat.get(wid).push(m);
+    }
+    console.log(`Fetched ${all.length} messages across ${byChat.size} chats`);
+  }
 
-    try {
-      const messages = await listAllMessages(wid, phone);
-      let mediaSaved = 0;
-      if (WITH_MEDIA) {
-        const dir = path.join(OUT_DIR, 'media', phone);
-        for (const m of messages) {
-          const media = msgMedia(m);
-          if (!media) continue;
-          fs.mkdirSync(dir, { recursive: true });
-          const id = (m.id || m._id || String(msgTs(m))).replace(/[^A-Za-z0-9._-]/g, '_');
-          const dest = path.join(dir, id + extFor(media.mime, media.filename));
-          if (fs.existsSync(dest) && !FORCE) { mediaSaved++; continue; }
-          try {
-            mediaBytes += await downloadMedia(media, dest);
-            mediaSaved++;
-            mediaFiles++;
-            await sleep(150);
-          } catch (err) {
-            console.warn(`  media failed for ${phone}/${id}: ${err.message}`);
-          }
+  // 2. Chat metadata.
+  const meta = ONLY.length ? new Map() : await fetchChatMetadata();
+  let metaFetched = 0;
+  for (const wid of byChat.keys()) {
+    if (!meta.has(wid)) {
+      const c = await fetchOneChat(wid);
+      if (c) { meta.set(wid, c); metaFetched++; }
+      await sleep(100);
+    }
+  }
+  if (metaFetched) console.log(`Fetched metadata individually for ${metaFetched} chats missing from the list`);
+
+  // 3. Write each chat.
+  const index = [];
+  let done = 0, mediaFiles = 0, mediaBytes = 0, mediaErrors = 0;
+  const ordered = [...byChat.entries()].sort((a, b) => {
+    const la = a[1].length ? msgTs(a[1][a[1].length - 1]) || 0 : 0;
+    const lb = b[1].length ? msgTs(b[1][b[1].length - 1]) || 0 : 0;
+    return lb - la;
+  });
+
+  for (const [wid, messages] of ordered) {
+    messages.sort((a, b) => (msgTs(a) || 0) - (msgTs(b) || 0));
+    const chat = meta.get(wid) || null;
+    const phone = phoneOf(chat?.contact?.phone || wid);
+    const safe = phone.replace(/[^A-Za-z0-9._-]/g, '_') || wid.replace(/[^A-Za-z0-9._-]/g, '_');
+    const name = chatName(chat);
+    const mediaPaths = new Map();
+    let mediaSaved = 0;
+
+    if (WITH_MEDIA) {
+      const dir = path.join(OUT_DIR, 'media', safe);
+      for (const m of messages) {
+        const media = msgMedia(m);
+        if (!media) continue;
+        fs.mkdirSync(dir, { recursive: true });
+        const id = String(m.id || msgTs(m)).replace(/[^A-Za-z0-9._-]/g, '_');
+        const file = id + extFor(media);
+        const dest = path.join(dir, file);
+        const rel = path.posix.join('media', safe, file);
+        if (fs.existsSync(dest) && !FORCE) { mediaPaths.set(m.id, rel); mediaSaved++; continue; }
+        try {
+          mediaBytes += await downloadMedia(media, dest);
+          mediaPaths.set(m.id, rel);
+          mediaSaved++;
+          mediaFiles++;
+          await sleep(100);
+        } catch (err) {
+          mediaErrors++;
+          console.warn(`  media failed for +${phone} msg ${id}: ${err.message}`);
         }
       }
+    }
 
-      const summary = {
-        phone,
-        wid,
-        name: chat.name || chat.contact?.name || chat.pushName || null,
-        labels: (chat.labels || chat.tags || []).map((l) => (typeof l === 'string' ? l : l?.name)).filter(Boolean),
-        messages: messages.length,
-        media: mediaSaved,
-        firstTs: messages.length ? msgTs(messages[0]) : null,
-        lastTs: messages.length ? msgTs(messages[messages.length - 1]) : lastTs,
-      };
-      fs.writeFileSync(jsonPath, JSON.stringify({ summary, lastTs, chat, messages }, null, 2));
-      fs.writeFileSync(txtPath, transcript(chat, messages));
-      index.push(summary);
-      done++;
-      console.log(`[${done + skipped}/${chats.length}] ${phone} ${summary.name || ''} — ${messages.length} msgs${WITH_MEDIA ? `, ${mediaSaved} media` : ''}`);
-      await sleep(200);
-    } catch (err) {
-      errors++;
-      console.error(`  FAILED ${phone}: ${err.message}`);
+    const last = messages[messages.length - 1] || null;
+    const summary = {
+      phone,
+      wid,
+      name,
+      labels: chatLabels(chat),
+      status: chat?.status || null,
+      messages: messages.length,
+      inbound: messages.filter((m) => !msgFromMe(m)).length,
+      outbound: messages.filter(msgFromMe).length,
+      media: messages.filter(msgMedia).length,
+      mediaSaved,
+      firstAt: messages.length ? new Date(msgTs(messages[0])).toISOString() : null,
+      lastAt: last ? new Date(msgTs(last)).toISOString() : null,
+      lastFrom: last ? (msgFromMe(last) ? 'me' : 'them') : null,
+      lastBody: last ? msgBody(last).slice(0, 200) : null,
+      file: `chats/${safe}.json`,
+    };
+    fs.writeFileSync(path.join(OUT_DIR, 'chats', `${safe}.json`), JSON.stringify({ summary, chat, messages }, null, 2));
+    fs.writeFileSync(path.join(OUT_DIR, 'chats', `${safe}.txt`), transcript(name, phone, messages, mediaPaths));
+    index.push(summary);
+    done++;
+    if (ONLY.length || done % 25 === 0) {
+      console.log(`[${done}/${ordered.length}] +${phone} ${name || ''} — ${messages.length} msgs${WITH_MEDIA ? `, ${mediaSaved}/${summary.media} media` : ''}`);
     }
   }
 
-  index.sort((a, b) => (b.lastTs || 0) - (a.lastTs || 0));
+  const totalMessages = index.reduce((n, c) => n + c.messages, 0);
   fs.writeFileSync(path.join(OUT_DIR, 'index.json'), JSON.stringify({
     device: DEVICE_ID,
     generatedAt: new Date().toISOString(),
     chats: index.length,
-    messages: index.reduce((n, c) => n + c.messages, 0),
-    chatsDownloaded: done,
-    chatsSkipped: skipped,
-    mediaFiles,
-    mediaBytes,
-    errors,
+    messages: totalMessages,
+    mediaMessages: index.reduce((n, c) => n + c.media, 0),
+    mediaFilesSaved: index.reduce((n, c) => n + c.mediaSaved, 0),
+    mediaFilesNew: mediaFiles,
+    mediaBytesNew: mediaBytes,
+    mediaErrors,
     index,
   }, null, 2));
 
-  console.log(`\nDone. ${done} chats downloaded, ${skipped} skipped, ${errors} errors.`);
-  console.log(`Total messages: ${index.reduce((n, c) => n + c.messages, 0)}`);
-  if (WITH_MEDIA) console.log(`Media: ${mediaFiles} new files, ${(mediaBytes / 1e6).toFixed(1)} MB`);
+  console.log(`\nDone. ${done} chats, ${totalMessages} messages.`);
+  if (WITH_MEDIA) console.log(`Media: ${mediaFiles} new files, ${(mediaBytes / 1e6).toFixed(1)} MB, ${mediaErrors} failed`);
   console.log(`Index: ${path.join(OUT_DIR, 'index.json')}`);
 })().catch((err) => {
   console.error('Backup failed:', err);
