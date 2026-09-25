@@ -22,6 +22,7 @@
  *
  * Output layout:
  *   <out>/index.json                 summary + one entry per chat
+ *   <out>/contacts.csv               one row per number (name, labels, last activity, wa.me link)
  *   <out>/chats/<phone>.json         { summary, chat, messages[] } raw API objects
  *   <out>/chats/<phone>.txt          human-readable transcript
  *   <out>/media/<phone>/<msgId>.<ext> media files (with --media)
@@ -239,12 +240,14 @@ async function fetchChatMetadata() {
       for (const c of list) {
         const wid = c.id || c.wid || c.contact?.wid;
         if (!wid) continue;
+        if (!byWid.has(wid)) added++;
         // Prefer the @c.us record over the @lid alias for the same contact.
         const existing = byWid.get(wid);
         if (!existing || (wid.endsWith('@c.us') && !existing.id?.endsWith('@c.us'))) byWid.set(wid, c);
-        added++;
       }
       process.stderr.write(`\rchat metadata: ${byWid.size}`);
+      // Stop when a page adds nothing new: some list views ignore `page` and
+      // keep returning the same records, which would otherwise loop forever.
       if (added === 0 || list.length < PAGE_SIZE) break;
       await sleep(150);
     }
@@ -336,6 +339,23 @@ function transcript(name, phone, messages, mediaPaths) {
   }
   if (metaFetched) console.log(`Fetched metadata individually for ${metaFetched} chats missing from the list`);
 
+  // 2b. Chats that exist in the list but have no synced messages (contact-only).
+  // Keep them so no phone number is lost; skip @lid aliases whose @c.us twin
+  // is already present.
+  let contactOnly = 0;
+  for (const [wid, c] of meta) {
+    if (byChat.has(wid)) continue;
+    if (wid.endsWith('@lid')) {
+      const twin = c.contact?.wid && c.contact.wid.endsWith('@c.us') ? c.contact.wid : null;
+      const phone = phoneOf(c.contact?.phone || '');
+      if ((twin && byChat.has(twin)) || (phone && byChat.has(`${phone}@c.us`))) continue;
+    }
+    if (c.type && c.type !== 'chat') continue; // groups, broadcasts, status
+    byChat.set(wid, []);
+    contactOnly++;
+  }
+  if (contactOnly) console.log(`Added ${contactOnly} contact-only chats with no synced messages`);
+
   // 3. Write each chat.
   const index = [];
   let done = 0, mediaFiles = 0, mediaBytes = 0, mediaErrors = 0;
@@ -406,6 +426,20 @@ function transcript(name, phone, messages, mediaPaths) {
   }
 
   const totalMessages = index.reduce((n, c) => n + c.messages, 0);
+
+  // contacts.csv: one row per number, ready for Excel / a CRM import.
+  const csvEsc = (v) => {
+    const s = v == null ? '' : String(v);
+    return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const csvHeader = ['phone', 'name', 'labels', 'status', 'messages', 'inbound', 'outbound', 'media',
+    'first_message_at', 'last_message_at', 'last_from', 'last_message', 'whatsapp_link', 'transcript_file'];
+  const csvRows = index.map((c) => [
+    `+${c.phone}`, c.name, c.labels.join('; '), c.status, c.messages, c.inbound, c.outbound, c.media,
+    c.firstAt, c.lastAt, c.lastFrom, c.lastBody, `https://wa.me/${c.phone}`, c.file.replace(/\.json$/, '.txt'),
+  ].map(csvEsc).join(','));
+  fs.writeFileSync(path.join(OUT_DIR, 'contacts.csv'), '﻿' + [csvHeader.join(','), ...csvRows].join('\r\n') + '\r\n');
+
   fs.writeFileSync(path.join(OUT_DIR, 'index.json'), JSON.stringify({
     device: DEVICE_ID,
     generatedAt: new Date().toISOString(),
@@ -422,6 +456,7 @@ function transcript(name, phone, messages, mediaPaths) {
   console.log(`\nDone. ${done} chats, ${totalMessages} messages.`);
   if (WITH_MEDIA) console.log(`Media: ${mediaFiles} new files, ${(mediaBytes / 1e6).toFixed(1)} MB, ${mediaErrors} failed`);
   console.log(`Index: ${path.join(OUT_DIR, 'index.json')}`);
+  console.log(`Contacts: ${path.join(OUT_DIR, 'contacts.csv')}`);
 })().catch((err) => {
   console.error('Backup failed:', err);
   process.exit(1);
