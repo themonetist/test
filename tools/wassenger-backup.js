@@ -365,20 +365,42 @@ function transcript(name, phone, messages, mediaPaths) {
   }
   if (contactOnly) console.log(`Added ${contactOnly} contact-only chats with no synced messages`);
 
+  // 2c. Merge chats that belong to the same phone number. WhatsApp can expose
+  // one contact under both `<phone>@c.us` and a `<n>@lid` alias; Wassenger
+  // then reports two chats. Writing them separately would let one overwrite
+  // the other's file, so combine their messages (deduplicated by id).
+  const byPhone = new Map(); // phone -> { wids, chat, messages }
+  for (const [wid, msgs] of byChat) {
+    const chat = meta.get(wid) || null;
+    const phone = phoneOf(chat?.contact?.phone || wid) || wid;
+    const entry = byPhone.get(phone) || { wids: [], chat: null, messages: [], seen: new Set() };
+    entry.wids.push(wid);
+    if (!entry.chat || (wid.endsWith('@c.us') && !entry.chat.id?.endsWith('@c.us'))) entry.chat = chat || entry.chat;
+    for (const m of msgs) {
+      const id = m.id || `${msgTs(m)}-${msgBody(m).slice(0, 20)}`;
+      if (entry.seen.has(id)) continue;
+      entry.seen.add(id);
+      entry.messages.push(m);
+    }
+    byPhone.set(phone, entry);
+  }
+  const merged = [...byPhone.values()].filter((e) => e.wids.length > 1).length;
+  if (merged) console.log(`Merged ${merged} contact(s) that Wassenger listed under two chat ids`);
+
   // 3. Write each chat.
   const index = [];
   let done = 0, mediaFiles = 0, mediaBytes = 0, mediaErrors = 0;
-  const ordered = [...byChat.entries()].sort((a, b) => {
-    const la = a[1].length ? msgTs(a[1][a[1].length - 1]) || 0 : 0;
-    const lb = b[1].length ? msgTs(b[1][b[1].length - 1]) || 0 : 0;
+  const ordered = [...byPhone.entries()].sort((a, b) => {
+    const la = a[1].messages.length ? Math.max(...a[1].messages.map((m) => msgTs(m) || 0)) : 0;
+    const lb = b[1].messages.length ? Math.max(...b[1].messages.map((m) => msgTs(m) || 0)) : 0;
     return lb - la;
   });
 
-  for (const [wid, messages] of ordered) {
+  for (const [phone, entry] of ordered) {
+    const { messages, chat } = entry;
+    const wid = entry.wids.find((w) => w.endsWith('@c.us')) || entry.wids[0];
     messages.sort((a, b) => (msgTs(a) || 0) - (msgTs(b) || 0));
-    const chat = meta.get(wid) || null;
-    const phone = phoneOf(chat?.contact?.phone || wid);
-    const safe = phone.replace(/[^A-Za-z0-9._-]/g, '_') || wid.replace(/[^A-Za-z0-9._-]/g, '_');
+    const safe = phone.replace(/[^A-Za-z0-9._-]/g, '_');
     const name = chatName(chat);
     const mediaPaths = new Map();
     let mediaSaved = 0;
@@ -411,6 +433,7 @@ function transcript(name, phone, messages, mediaPaths) {
     const summary = {
       phone,
       wid,
+      wids: entry.wids,
       name,
       labels: chatLabels(chat),
       status: chat?.status || null,

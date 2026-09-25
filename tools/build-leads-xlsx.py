@@ -15,6 +15,7 @@ Sheets:
 """
 
 import json
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -27,6 +28,31 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 FONT = "Arial"
 BALI = timezone(timedelta(hours=8))  # WITA
 CELL_LIMIT = 32000  # Excel hard limit is 32,767 chars per cell
+
+# Characters that are illegal in the XML inside an .xlsx. WhatsApp messages
+# occasionally contain them (stray control codes, lone surrogates) and Excel
+# refuses to open a file that has even one.
+_ILLEGAL = re.compile(
+    "[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ud800-\udfff￾￿]"
+)
+
+
+def clean(value):
+    """Return a string Excel will accept: illegal XML chars removed, length capped."""
+    if value is None:
+        return None
+    s = _ILLEGAL.sub("", str(value))
+    if len(s) > CELL_LIMIT:
+        s = s[: CELL_LIMIT - 40] + "\n[... truncated ...]"
+    return s
+
+
+def append_text_row(ws, values):
+    """ws.append() but every string is cleaned and stored as text, never as a formula."""
+    ws.append([clean(v) if isinstance(v, str) else v for v in values])
+    for c in ws[ws.max_row]:
+        if isinstance(c.value, str):
+            c.data_type = "s"
 
 
 def parse_ts(v):
@@ -113,7 +139,7 @@ def main(backup_dir, out_path):
             transcript = transcript[:CELL_LIMIT - 60] + "\n[... truncated, full text on the Messages sheet ...]"
             truncated += 1
 
-        ws.append([
+        append_text_row(ws, [
             f"+{e['phone']}", e.get("name"), "; ".join(e.get("labels") or []), e.get("status"),
             e.get("messages", 0), e.get("inbound", 0), e.get("outbound", 0), e.get("media", 0),
             naive_bali(parse_ts(e.get("firstAt"))), naive_bali(parse_ts(e.get("lastAt"))),
@@ -148,7 +174,7 @@ def main(backup_dir, out_path):
     wm.append(msg_headers)
     message_rows.sort(key=lambda r: (r[0], r[2] or datetime.min))
     for r in message_rows:
-        wm.append(r)
+        append_text_row(wm, r)
     style_header(wm, len(msg_headers))
     for i, w in enumerate([16, 26, 18, 7, 10, 90, 36], start=1):
         wm.column_dimensions[get_column_letter(i)].width = w
@@ -188,7 +214,7 @@ def main(backup_dir, out_path):
         ("Source", "Wassenger REST API, exported with tools/wassenger-backup.js; times shown in Bali time (UTC+8)."),
     ]
     for label, value in rows:
-        wsum.append([label, value])
+        wsum.append([label, value])  # Summary values are formulas on purpose
     wsum["A1"].font = Font(name=FONT, bold=True, size=14)
     for row in wsum.iter_rows(min_row=2, max_row=wsum.max_row):
         row[0].font = Font(name=FONT, bold=True)
