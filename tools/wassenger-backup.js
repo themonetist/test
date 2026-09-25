@@ -268,7 +268,16 @@ async function fetchOneChat(wid) {
 async function downloadMedia(media, dest) {
   let res;
   if (media.id) {
-    res = await api(`/chat/${DEVICE_ID}/files/${encodeURIComponent(media.id)}/download`, {}, { raw: true });
+    // Fail fast: an expired file answers 503 every time, so the normal
+    // retry/backoff would only add ~40s per missing file.
+    const url = `${API_BASE}/chat/${DEVICE_ID}/files/${encodeURIComponent(media.id)}/download`;
+    res = await fetch(url, { headers: { Authorization: API_KEY } });
+    if (res.status === 429) { await sleep(3000); res = await fetch(url, { headers: { Authorization: API_KEY } }); }
+    if (!res.ok) {
+      const err = new Error(`${res.status} ${res.statusText}${media.expiresAt ? ` (expired ${media.expiresAt})` : ''}`);
+      err.status = res.status;
+      throw err;
+    }
   } else {
     const abs = /^https?:/i.test(media.link) ? media.link : new URL(API_BASE).origin + media.link;
     res = await fetch(abs, { headers: { Authorization: API_KEY } });
