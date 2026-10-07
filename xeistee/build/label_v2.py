@@ -15,7 +15,7 @@ EAN_BAR, MARK_D, QR_S = 11.0, 9.4, 9.0
 CAP_V = 1.45     # freiwilliger Text (Hinweise, Story, URL)
 EAN_GAP = 3.0
 BG_TONE = 'gelb'                 # 'gelb' | 'gold'
-GS_MODE = 'mhd'                  # Gesaeuse-Siegel: 'mhd' | 'siegel' | 'ean-unten' | 'ean-oben'
+GS_MODE = 'mhd'                  # Gesaeuse-Siegel: 'mhd' | 'qr' | 'siegel' | 'ean-unten' | 'ean-oben'
 GLOW = {'gelb': ("#EFCF70", "#EED490", "#EDDCB8", "#ECDFC9"),
         'gold': ("#D6B37D", "#DDC299", "#E6D5BB", "#EADDCA")}
 
@@ -239,7 +239,7 @@ def build(bg_png=None):
     # Platz fuer das Gesaeuse-Siegel reservieren - im engsten Format darf es
     # schrumpfen, bevor der freiwillige Text unleserlich klein wird.
     # Steht es in der Barcode-Spalte, braucht die MHD-Spalte keinen Platz dafuer.
-    for _ges in ((0.0,) if GS_MODE.startswith('ean') or GS_MODE == 'siegel' else (6.2, 5.6, 5.0, 4.5)):
+    for _ges in ((0.0,) if GS_MODE in ('ean-unten', 'ean-oben', 'siegel', 'qr') else (6.2, 5.6, 5.0, 4.5)):
         blk_h = _mhd_h + _leaf_h if GS_MODE == 'siegel' else max(_leaf_h, len(_mhd)*BASE + 1.0 + _ges)
         avail = (BOTTOM - blk_h) - 1.3 - y
         cv, lead = CAP_V, 0.86*BASE
@@ -285,7 +285,8 @@ def build(bg_png=None):
         vh = min(BOTTOM - (ry - BASE + 1.4), rw * GS_ASPECT, 8.0)
         vw = vh / GS_ASPECT
         vy0 = BOTTOM - vh
-    s.append(svg_place_visual(GS, vx0, vy0, vw, "gesaeuse-partner", fill=INK))
+    if GS_MODE != 'qr':
+        s.append(svg_place_visual(GS, vx0, vy0, vw, "gesaeuse-partner", fill=INK))
     if y > ty - 1.0:
         print(f"  ! Zutatenspalte zu lang: {y:.1f} > {ty-1.0:.1f}")
     print(f"  Hinweise cap {cv:.2f} mm, {len(lns)} Zeilen")
@@ -341,17 +342,25 @@ def build(bg_png=None):
              f'transform="translate({x:.3f},{BOTTOM-qs:.3f}) scale({qs/n:.5f})">{_inner(q)}</g>')
     tx = x + qs + 2.2
     tw = maxw - qs - 2.2
-    lines = [ln for st in STORY for ln in wrap_text(st, T[400], CAP_V*1.1, tw)]
-    blk = len(lines)*BASE*0.92 + 0.3 + CAP_B
+    # 'qr': ohne Story, URL mittig zum QR, Gesaeuse-Siegel rechts buendig in derselben Reihe
+    uc = CAP_V if GS_MODE == 'qr' else CAP_B
+    lines = [] if GS_MODE == 'qr' else [ln for st in STORY for ln in wrap_text(st, T[400], CAP_V*1.1, tw)]
+    blk = len(lines)*BASE*0.92 + 0.3 + uc if lines else uc
     sy = BOTTOM - qs + (qs - blk)/2 + CAP_V
     for i, ln in enumerate(lines):
         t, _ = left_text(ln, T[400], CAP_V, tx, sy + i*BASE*0.92, INK); s.append(t)
-    uy = sy + len(lines)*BASE*0.92 + 0.3
-    ay = uy - CAP_B*0.5
+    uy = sy + len(lines)*BASE*0.92 + 0.3 if lines else BOTTOM - qs/2 + uc/2
+    ay = uy - uc*0.5
+    if GS_MODE == 'qr':
+        urlw = 3.4 + V.natural_w("kraeuterbergbauer.at", T[600], uc)
+        vw = min(maxw - qs - 2.2 - urlw - 2.5, qs / GS_ASPECT)
+        vh = vw * GS_ASPECT
+        s.append(svg_place_visual(GS, x + maxw - vw, BOTTOM - qs/2 - vh/2, vw,
+                                  "gesaeuse-partner", fill=INK))
     s.append(f'<path inkscape:label="Pfeil zum QR" d="M{tx+2.2:.2f},{ay:.2f} H{tx+0.3:.2f} '
              f'M{tx+0.9:.2f},{ay-0.6:.2f} L{tx+0.25:.2f},{ay:.2f} L{tx+0.9:.2f},{ay+0.6:.2f}" '
              f'fill="none" stroke="{INK}" stroke-width="0.25" stroke-linecap="round" stroke-linejoin="round"/>')
-    t, _ = left_text("kraeuterbergbauer.at", T[600], CAP_B, tx + 3.4, uy, INK); s.append(t)
+    t, _ = left_text("kraeuterbergbauer.at", T[600], uc, tx + 3.4, uy, INK); s.append(t)
     s.append("</svg>")
     return "".join(s)
 

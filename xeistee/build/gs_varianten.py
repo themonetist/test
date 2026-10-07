@@ -6,7 +6,7 @@ import fmt, label_v2 as L
 
 OUT = "out/gesaeuse-varianten/"
 VARIANTEN = [("A", "mhd",       "rechts unter MHD, links buendig, Unterkante = QR-Unterkante"),
-             ("D", "siegel",    "Siegelreihe neben EU-Blatt, MHD/Los als Zeile darueber")]
+             ("E", "qr",        "QR-Reihe ohne Story: QR | URL | Gesaeuse rechts buendig")]
 
 def run():
     os.makedirs(OUT, exist_ok=True)
@@ -26,7 +26,8 @@ def run():
               f"x {vx0-L.OX:.2f}..{vx1-L.OX:.2f}, y {vy0-L.OY:.2f}..{vy1-L.OY:.2f} (ab Schnittkante), "
               f"Abstand Schnitt links {vx0-L.OX:.2f} / unten {L.OY+L.TRIM_H-vy1:.2f}")
         im = Image.open(stem + ".png"); px = im.width / L.W
-        c = im.crop((0, round(24*px), round(52*px), round(54*px)))
+        c = im.crop((0, round(24*px), round(52*px), round(54*px))) if mode != 'qr' else \
+            im.crop((round(106*px), round(24*px), round(158*px), round(54*px)))
         c.save(stem + "-detail.png"); crops.append((key, desc, c))
     # Vergleichsblatt
     cw, ch = crops[0][2].size
