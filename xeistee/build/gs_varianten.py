@@ -5,8 +5,11 @@ from PIL import Image, ImageDraw, ImageFont
 import fmt, label_v2 as L
 
 OUT = "out/gesaeuse-varianten/"
-VARIANTEN = [("A", "mhd",       "rechts unter MHD, links buendig, Unterkante = QR-Unterkante"),
-             ("E", "qr",        "QR-Reihe ohne Story: QR | URL | Gesaeuse rechts buendig")]
+VARIANTEN = [("E", "qr",        "QR | URL | Gesaeuse (vorher)"),
+             ("F", "qr-unter",  "URL unter dem QR, Gesaeuse rechts"),
+             ("G", "qr-text",   "Story wieder da, kleiner, Gesaeuse rechts"),
+             ("H", "qr-breit",  "QR groesser, URL darunter gleich breit"),
+             ("I", "qr-rechts", "gespiegelt: Gesaeuse links, QR + URL rechts")]
 
 def run():
     os.makedirs(OUT, exist_ok=True)
@@ -26,7 +29,7 @@ def run():
               f"x {vx0-L.OX:.2f}..{vx1-L.OX:.2f}, y {vy0-L.OY:.2f}..{vy1-L.OY:.2f} (ab Schnittkante), "
               f"Abstand Schnitt links {vx0-L.OX:.2f} / unten {L.OY+L.TRIM_H-vy1:.2f}")
         im = Image.open(stem + ".png"); px = im.width / L.W
-        c = im.crop((0, round(24*px), round(52*px), round(54*px))) if mode != 'qr' else \
+        c = im.crop((0, round(24*px), round(52*px), round(54*px))) if not mode.startswith('qr') else \
             im.crop((round(106*px), round(24*px), round(158*px), round(54*px)))
         c.save(stem + "-detail.png"); crops.append((key, desc, c))
     # Vergleichsblatt
