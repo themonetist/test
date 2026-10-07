@@ -15,18 +15,19 @@ EAN_BAR, MARK_D, QR_S = 11.0, 9.4, 9.0
 CAP_V = 1.45     # freiwilliger Text (Hinweise, Story, URL)
 EAN_GAP = 3.0
 BG_TONE = 'gelb'                 # 'gelb' | 'gold'
+GS_MODE = 'mhd'                  # Gesaeuse-Siegel: 'mhd' | 'ean-unten' | 'ean-oben'
 GLOW = {'gelb': ("#EFCF70", "#EED490", "#EDDCB8", "#ECDFC9"),
         'gold': ("#D6B37D", "#DDC299", "#E6D5BB", "#EADDCA")}
 
 def configure(trim_w=177.0, trim_h=80.0, bleed=3.0, *, ean_bar=11.0, mark_d=9.4,
               qr_s=9.0, cap_b=1.70, cap_s=1.70, cap_h=2.3, base=2.4,
               top=6.6, bottom=47.0, band_png=None, bg_tone='gelb', margin=5.0,
-              cap_v=1.45, ean_gap=3.0):
+              cap_v=1.45, ean_gap=3.0, gs_mode='mhd'):
     """Set the label format. Everything derived is recomputed here."""
     global TRIM_W, TRIM_H, BLEED, W, H, OX, OY, SIDE_W
     global FRONT_X0, FRONT_X1, CXF, LEFT_X0, RIGHT_X1
     global EAN_BAR, MARK_D, QR_S, CAP_B, CAP_S, CAP_H, BASE, TOP, BOTTOM
-    global BAND_PNG, BG_TONE, M, CAP_V, EAN_GAP
+    global BAND_PNG, BG_TONE, M, CAP_V, EAN_GAP, GS_MODE
     TRIM_W, TRIM_H, BLEED = trim_w, trim_h, bleed
     W, H = TRIM_W + 2*BLEED, TRIM_H + 2*BLEED
     OX = OY = BLEED
@@ -40,6 +41,7 @@ def configure(trim_w=177.0, trim_h=80.0, bleed=3.0, *, ean_bar=11.0, mark_d=9.4,
     EAN_GAP = ean_gap
     TOP, BOTTOM = OY + top, OY + bottom
     BG_TONE = bg_tone
+    GS_MODE = gs_mode
     if band_png: BAND_PNG = band_png
 # PLACEHOLDER values - typical for a herbal drink with apple juice + sugar. Replace with the
 # LK Steiermark calculation before print. Rounding per LMIV Annex-XV guidance.
@@ -130,6 +132,17 @@ def svg_place(path, x, y, w, h=None, lid=None):
     return (f'<g id="{lid or "placed"}" inkscape:label="{lid or "placed"}" transform="translate({ox:.4f},{oy:.4f}) scale({sc:.6f})">'
             f'<g transform="translate({-vx},{-vy})">{body}</g></g>'), vh*sc
 
+GS_BOX = (168, 104, 3068, 1928)    # sichtbare Kontur von gs_partner.svg in viewBox-Einheiten
+GS_ASPECT = (GS_BOX[3] - GS_BOX[1]) / (GS_BOX[2] - GS_BOX[0])
+
+def svg_place_visual(path, vx, vy, vw, lid, fill=None):
+    """Place an SVG so its VISIBLE outline (GS_BOX) starts at vx, vy and is vw wide."""
+    s = open(path, encoding="utf-8").read()
+    if fill: s = s.replace('fill="#000000"', f'fill="{fill}"')
+    sc = vw / (GS_BOX[2] - GS_BOX[0])
+    return (f'<g id="{lid}" inkscape:label="{lid}" transform="translate({vx - GS_BOX[0]*sc:.4f},'
+            f'{vy - GS_BOX[1]*sc:.4f}) scale({sc:.6f})">{_inner(s)}</g>')
+
 def img(path, x, y, w, h, lid=None):
     tag = f'<image id="{lid}" inkscape:label="{lid}" ' if lid else "<image "
     return V.img_tag(path, x, y, w, h, preserve="none").replace("<image ", tag, 1)
@@ -213,12 +226,15 @@ def build(bg_png=None):
     _cc0 = min(1.9, 1.8*13.5/V.natural_w(L.BIO_CODE, T[500], 1.8))
     _co0 = min(CAP_S, CAP_S*13.5/V.natural_w(L.BIO_ORIGIN, T[300], CAP_S))
     _mhdw = maxw - 13.5 - 2.2
-    _mhd = [l for t_ in ('Mindestens haltbar bis: 31.12.2027', 'Los: L 2609')
-            for l in wrap_text(t_, T[300], CAP_B*1.1, _mhdw)]
+    # feste Zeilen: "Los:" entfaellt, die Losnummer beginnt selbst mit "L" (RL 2011/91/EU)
+    _mhd = ['Mindestens', 'haltbar bis Ende:', '10/2028', 'L-202765071']
+    for l in _mhd:
+        assert V.natural_w(l, T[300], CAP_B) <= _mhdw, f"MHD-Zeile zu breit: {l}"
     _leaf_h = 9.0 + 1.0 + _cc0 + 0.7 + _co0
     # Platz fuer das Gesaeuse-Siegel reservieren - im engsten Format darf es
-    # schrumpfen, bevor der freiwillige Text unleserlich klein wird
-    for _ges in (6.2, 5.6, 5.0, 4.5):
+    # schrumpfen, bevor der freiwillige Text unleserlich klein wird.
+    # Steht es in der Barcode-Spalte, braucht die MHD-Spalte keinen Platz dafuer.
+    for _ges in ((0.0,) if GS_MODE.startswith('ean') else (6.2, 5.6, 5.0, 4.5)):
         blk_h = max(_leaf_h, len(_mhd)*BASE + 1.0 + _ges)
         avail = (BOTTOM - blk_h) - 1.3 - y
         cv, lead = CAP_V, 0.86*BASE
@@ -243,10 +259,21 @@ def build(bg_png=None):
     ry = by + CAP_B
     for ln in mhd:
         t, _ = left_text(ln, T[300], CAP_B, rx, ry, INK); s.append(t); ry += BASE
-    gh = min(blk_h - len(mhd)*BASE - 1.0, rw * 508/809, 8.0)
-    gw = gh * 809/508
-    g, _ = svg_place(GS, rx + (rw - gw)/2, BOTTOM - gh, gw, None, "gesaeuse-partner")
-    s.append(g)
+    # Gesaeuse-Siegel: ausgerichtet wird an der sichtbaren Kontur (GS_BOX), nicht am viewBox
+    base_o = by + lh + 1.0 + cc + 0.7 + co            # Grundlinie "Österreich-Landwirtschaft"
+    if GS_MODE.startswith('ean'):
+        # Barcode-Spalte unter dem EAN: buendig mit den Balken links und den Ziffern rechts
+        # (EH hat unter den Ziffern 0,5 mm Luft, gemessen am Render)
+        vx0 = ex; vw = EH - 0.5
+        vh = vw * GS_ASPECT
+        vy0 = by if GS_MODE == 'ean-oben' else base_o - vh
+    else:
+        # rechte Spalte: links buendig mit MHD, Unterkante auf der gemeinsamen Grundlinie
+        vx0 = rx
+        vh = min(BOTTOM - (ry - BASE + 1.4), rw * GS_ASPECT, 8.0)
+        vw = vh / GS_ASPECT
+        vy0 = BOTTOM - vh
+    s.append(svg_place_visual(GS, vx0, vy0, vw, "gesaeuse-partner", fill=INK))
     if y > by - 1.0:
         print(f"  ! Zutatenspalte zu lang: {y:.1f} > {by-1.0:.1f}")
 
