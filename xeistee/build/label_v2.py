@@ -15,7 +15,7 @@ EAN_BAR, MARK_D, QR_S = 11.0, 9.4, 9.0
 CAP_V = 1.45     # freiwilliger Text (Hinweise, Story, URL)
 EAN_GAP = 3.0
 BG_TONE = 'gelb'                 # 'gelb' | 'gold'
-GS_MODE = 'mhd'                  # Gesaeuse-Siegel: 'mhd' | 'ean-unten' | 'ean-oben'
+GS_MODE = 'mhd'                  # Gesaeuse-Siegel: 'mhd' | 'siegel' | 'ean-unten' | 'ean-oben'
 GLOW = {'gelb': ("#EFCF70", "#EED490", "#EDDCB8", "#ECDFC9"),
         'gold': ("#D6B37D", "#DDC299", "#E6D5BB", "#EADDCA")}
 
@@ -227,15 +227,20 @@ def build(bg_png=None):
     _co0 = min(CAP_S, CAP_S*13.5/V.natural_w(L.BIO_ORIGIN, T[300], CAP_S))
     _mhdw = maxw - 13.5 - 2.2
     # feste Zeilen: "Los:" entfaellt, die Losnummer beginnt selbst mit "L" (RL 2011/91/EU)
-    _mhd = ['Mindestens', 'haltbar bis Ende:', '10/2028', 'L-202765071']
+    # 'siegel': MHD/Los volle Breite ueber einer Siegelreihe EU-Blatt + Gesaeuse
+    if GS_MODE == 'siegel':
+        _mhd, _mhdw = ['Mindestens haltbar bis Ende: 10/2028', 'L-202765071'], maxw
+    else:
+        _mhd = ['Mindestens', 'haltbar bis Ende:', '10/2028', 'L-202765071']
     for l in _mhd:
         assert V.natural_w(l, T[300], CAP_B) <= _mhdw, f"MHD-Zeile zu breit: {l}"
     _leaf_h = 9.0 + 1.0 + _cc0 + 0.7 + _co0
+    _mhd_h = CAP_B + (len(_mhd) - 1)*BASE + 1.6 if GS_MODE == 'siegel' else 0.0
     # Platz fuer das Gesaeuse-Siegel reservieren - im engsten Format darf es
     # schrumpfen, bevor der freiwillige Text unleserlich klein wird.
     # Steht es in der Barcode-Spalte, braucht die MHD-Spalte keinen Platz dafuer.
-    for _ges in ((0.0,) if GS_MODE.startswith('ean') else (6.2, 5.6, 5.0, 4.5)):
-        blk_h = max(_leaf_h, len(_mhd)*BASE + 1.0 + _ges)
+    for _ges in ((0.0,) if GS_MODE.startswith('ean') or GS_MODE == 'siegel' else (6.2, 5.6, 5.0, 4.5)):
+        blk_h = _mhd_h + _leaf_h if GS_MODE == 'siegel' else max(_leaf_h, len(_mhd)*BASE + 1.0 + _ges)
         avail = (BOTTOM - blk_h) - 1.3 - y
         cv, lead = CAP_V, 0.86*BASE
         for _ in range(14):
@@ -249,6 +254,8 @@ def build(bg_png=None):
     lw, lh = 13.5, 9.0
     cc, co = _cc0, _co0
     by = BOTTOM - blk_h
+    ty = by                                   # Oberkante des Textblocks
+    by = by + _mhd_h                          # Oberkante EU-Blatt
     g, _ = svg_place(EU, x, by, lw, lh, "eu-leaf"); s.append(g)
     s.append(left_text(L.BIO_CODE,   T[500], cc, x, by + lh + 1.0 + cc, INK)[0])
     s.append(left_text(L.BIO_ORIGIN, T[300], co, x, by + lh + 1.0 + cc + 0.7 + co, INK)[0])
@@ -256,9 +263,9 @@ def build(bg_png=None):
     rx = x + lw + 2.2
     rw = maxw - lw - 2.2
     mhd = _mhd
-    ry = by + CAP_B
+    mx, ry = (x, ty + CAP_B) if GS_MODE == 'siegel' else (rx, by + CAP_B)
     for ln in mhd:
-        t, _ = left_text(ln, T[300], CAP_B, rx, ry, INK); s.append(t); ry += BASE
+        t, _ = left_text(ln, T[300], CAP_B, mx, ry, INK); s.append(t); ry += BASE
     # Gesaeuse-Siegel: ausgerichtet wird an der sichtbaren Kontur (GS_BOX), nicht am viewBox
     base_o = by + lh + 1.0 + cc + 0.7 + co            # Grundlinie "Österreich-Landwirtschaft"
     if GS_MODE.startswith('ean'):
@@ -267,6 +274,11 @@ def build(bg_png=None):
         vx0 = ex; vw = EH - 0.5
         vh = vw * GS_ASPECT
         vy0 = by if GS_MODE == 'ean-oben' else base_o - vh
+    elif GS_MODE == 'siegel':
+        # Siegelreihe: rechts neben dem EU-Blatt, Spaltenbreite, Oberkante = Oberkante Blatt
+        vx0, vw = rx, rw
+        vh = vw * GS_ASPECT
+        vy0 = by
     else:
         # rechte Spalte: links buendig mit MHD, Unterkante auf der gemeinsamen Grundlinie
         vx0 = rx
@@ -274,8 +286,9 @@ def build(bg_png=None):
         vw = vh / GS_ASPECT
         vy0 = BOTTOM - vh
     s.append(svg_place_visual(GS, vx0, vy0, vw, "gesaeuse-partner", fill=INK))
-    if y > by - 1.0:
-        print(f"  ! Zutatenspalte zu lang: {y:.1f} > {by-1.0:.1f}")
+    if y > ty - 1.0:
+        print(f"  ! Zutatenspalte zu lang: {y:.1f} > {ty-1.0:.1f}")
+    print(f"  Hinweise cap {cv:.2f} mm, {len(lns)} Zeilen")
 
     # ================= RIGHT : Nährwerte | Erzeuger | QR + Gesäuse =================
     s.append('<!--LAYER:Naehrwerte-->')

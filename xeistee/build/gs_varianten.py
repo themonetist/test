@@ -6,8 +6,7 @@ import fmt, label_v2 as L
 
 OUT = "out/gesaeuse-varianten/"
 VARIANTEN = [("A", "mhd",       "rechts unter MHD, links buendig, Unterkante = QR-Unterkante"),
-             ("B", "ean-unten", "unter dem Barcode, Unterkante = Grundlinie Österreich-Landwirtschaft"),
-             ("C", "ean-oben",  "unter dem Barcode, Oberkante = Oberkante EU-Blatt")]
+             ("D", "siegel",    "Siegelreihe neben EU-Blatt, MHD/Los als Zeile darueber")]
 
 def run():
     os.makedirs(OUT, exist_ok=True)
