@@ -1,0 +1,257 @@
+"""X'Eistee 80 mm label, v2 layout: one baseline grid, one margin system, real marks.
+
+Grid: 2.4 mm baseline grid, 5 mm side margins, shared top baseline y=9.6 mm across
+all three panels, shared bottom edge y=44.0 mm for every panel's last element.
+"""
+import re, base64, math
+import PIL.Image as I
+import variants as V
+import label_ink as L          # copy + helpers (left_text, wrap_text, palette)
+import qr_brand, ean_brand
+import marks
+MARK_STYLE = 'brushfill'
+# PLACEHOLDER values - typical for a herbal drink with apple juice + sugar. Replace with the
+# LK Steiermark calculation before print. Rounding per LMIV Annex-XV guidance.
+NAEHRWERT = [   # final figures from the calculation, Sep 14 2026
+    ("Brennwert",                   "103 kJ / 24 kcal", False),
+    ("Fett",                        "0 g",              False),
+    ("davon gesättigte Fettsäuren", "0 g",              True),
+    ("Kohlenhydrate",               "6,0 g",            False),
+    ("davon Zucker",                "5,9 g",            True),
+    ("Eiweiß",                      "0,1 g",            False),
+    ("Salz",                        "0 g",              False),
+]
+HINWEISE = ["Flasche vor Gebrauch schütteln.",
+            "Kühl und dunkel lagern und nach dem Öffnen alsbald verbrauchen!",
+            "Pfandflasche."]
+STORY = ["Bergkräuter aus dem Gesäuse.",
+         "Vom Bio-Bergbauernhof in Landl."]
+
+def roundel(x, y, d, top, bottom, fill, paper):
+    """Own small claim mark: ink disc, two lines of paper-coloured caps."""
+    r = d/2; cx, cy = x + r, y + r
+    out = [f'<g inkscape:label="Marke {top} {bottom or ""}"><circle cx="{cx:.3f}" cy="{cy:.3f}" r="{r:.3f}" fill="{fill}"/>']
+    if bottom:
+        cap, inner = d*0.17, d*0.80
+        for t2 in (top, bottom):
+            w2 = _VM.natural_w(t2, _VM.TEXT_FONTS[600], cap) + 0.12*(len(t2)-1)
+            if w2 > inner: cap *= inner/w2
+        out.append(V.text_block(top,    V.TEXT_FONTS[600], cap, cx, cy - d*0.04, paper, tracking=0.12))
+        out.append(V.text_block(bottom, V.TEXT_FONTS[600], cap, cx, cy + d*0.19, paper, tracking=0.12))
+    else:
+        out.append(V.text_block(top, V.TEXT_FONTS[600], d*0.2, cx, cy + d*0.08, paper, tracking=0.15))
+    return "".join(out) + "</g>"
+
+wrap_text = L.wrap_text
+def _lab(name):
+    return (name[:60].replace('&','&amp;').replace('"','&quot;')
+            .replace('<','&lt;').replace('>','&gt;'))
+def left_text(txt, path, cap, x, baseline, fill, tracking=0.0):
+    t, w = L.left_text(txt, path, cap, x, baseline, fill, tracking)
+    return f'<g inkscape:label="{_lab(txt)}">{t}</g>', w
+import variants as _VM
+class _V:
+    def __getattr__(self, k): return getattr(_VM, k)
+    def text_block(self, text, *a, **kw):
+        return f'<g inkscape:label="{_lab(text)}">{_VM.text_block(text, *a, **kw)}</g>'
+V = _V()
+P, T = L.P, V.TEXT_FONTS
+INK, CREAM, RED = P["ink"], P["cream"], "#C00015"
+EU = "eu/euzip/logo_eps/EU_Organic_Logo_Colour_54x36mm.svg"
+GS = "eu/gs_partner.svg"
+LACON = "eu/lacon.png"
+
+TRIM_W, TRIM_H, BLEED = 177.0, 80.0, 3.0
+W, H = TRIM_W + 2*BLEED, TRIM_H + 2*BLEED
+OX, OY = BLEED, BLEED
+PANEL_W = 60.4
+SIDE_W = (TRIM_W - PANEL_W)/2
+FRONT_X0 = OX + SIDE_W; FRONT_X1 = FRONT_X0 + PANEL_W; CXF = (FRONT_X0+FRONT_X1)/2
+LEFT_X0, RIGHT_X1 = OX, OX + TRIM_W
+
+# ---- the system
+M      = 5.0        # side margin inside the trim
+BASE   = 2.4        # baseline grid
+TOP    = OY + 6.6   # first baseline (9.6 mm from the bleed edge)
+BOTTOM = OY + 47.0  # bottom edge of the side panels' content (50.0); band starts at 56
+CAP_H  = 2.3        # headings
+CAP_B  = 1.6        # body
+CAP_S  = 1.45       # small print
+BAND_H = 30.0
+BAND_PNG = 'art/bandF-wide.png'   # 1.5x wide (mirrored ends), natural height 37.6 mm at label width
+BAND_OVER = 4.6    # band 3 mm hoeher: unterste Beere bekommt 3 mm Luft zur Schnittkante
+MTN_H  = 36.0
+
+def _inner(svg_text):
+    return svg_text[svg_text.index(">", svg_text.index("<svg"))+1:svg_text.rindex("</svg>")]
+
+def svg_place(path, x, y, w, h=None, lid=None):
+    """Place an SVG file's content scaled into a w x h box (uniform scale)."""
+    s = open(path, encoding="utf-8").read()
+    m = re.search(r'viewBox="([\d.\-eE ]+)"', s)
+    vx, vy, vw, vh = map(float, m.group(1).split())
+    sc = w / vw
+    if h is None: h = vh*sc
+    else: sc = min(sc, h/vh)
+    ox = x + (w - vw*sc)/2; oy = y + (h - vh*sc)/2
+    body = _inner(s)
+    # potrace / pdftocairo wrap their content in their own transforms - keep as is
+    return (f'<g id="{lid or "placed"}" inkscape:label="{lid or "placed"}" transform="translate({ox:.4f},{oy:.4f}) scale({sc:.6f})">'
+            f'<g transform="translate({-vx},{-vy})">{body}</g></g>'), vh*sc
+
+def img(path, x, y, w, h, lid=None):
+    tag = f'<image id="{lid}" inkscape:label="{lid}" ' if lid else "<image "
+    return V.img_tag(path, x, y, w, h, preserve="none").replace("<image ", tag, 1)
+
+def wm_bbox():
+    im = I.open(V.WORDMARK); a = im.split()[-1].point(lambda v: 255 if v > 60 else 0)
+    return a.getbbox(), im.size
+
+def build(bg_png=None):
+    s = [f'<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" '
+         f'xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape" '
+         f'width="{W}mm" height="{H}mm" viewBox="0 0 {W} {H}">']
+    s.append('<!--LAYER:Hintergrund-->')
+    s.append(f'<rect width="{W}" height="{H}" fill="{CREAM}"/>' if not bg_png
+             else img(bg_png, 0, 0, W, H, "bg"))
+
+    # ---- mountain + band (unchanged art)
+    s.append('<!--LAYER:Berg-->')
+    mi = I.open("art/mtn-flat-k.png"); mw = MTN_H*mi.width/mi.height
+    base_y = OY + 0.985*TRIM_H - 3.0   # Berg mit dem Band mit nach oben, Gipfel bleibt gleich sichtbar
+    s.append(img("art/mtn-flat-k.png", CXF - mw*0.5586, base_y - MTN_H, mw, MTN_H, "berg"))
+    s.append('<!--LAYER:Band-->')
+    # band at its NATURAL aspect (never squashed); it overlaps the bottom bleed and is cut off there
+    bi = I.open(BAND_PNG); bh = (W + 1.0) * bi.height / bi.width
+    s.append(img(BAND_PNG, -0.5, H + BAND_OVER - bh, W + 1.0, bh, "band"))
+
+    # ================= FRONT =================
+    s.append('<!--LAYER:Front-->')
+    (bx0, by0, bx1, by1), (iw, ih) = wm_bbox()
+    vis_w = 48.0                                   # visual width of the wordmark
+    sc = vis_w / (bx1 - bx0)
+    wm_w, wm_h = iw*sc, ih*sc
+    wm_x = CXF - (bx0 + (bx1-bx0)/2)*sc
+    wm_top = TOP + 3.0                             # 2.6 mm below the BIO baseline
+    wm_y = wm_top - by0*sc
+    s.append(img(V.WORDMARK, wm_x, wm_y, wm_w, wm_h, "wordmark"))
+    wm_bottom = wm_y + by1*sc
+    # BIO left, ℮ 330 ml right - same cap as the subtitle, on the shared top baseline,
+    # flush with the wordmark's visual edges
+    lx, rx = CXF - vis_w/2, CXF + vis_w/2
+    FC = 2.8   # front caps: BIO and 330 ml; the ℮ is 3.0 mm (legal minimum), so it sits in line
+    t, _ = left_text("BIO", T[600], FC, lx, TOP, INK, tracking=0.3); s.append(t)
+    # ℮ must be >= 3 mm tall (Dir. 76/211/EEC): Oswald's glyph is 584/810 of cap height
+    e_cap = 3.0 * 810/584
+    wv = V.natural_w("330 ml", T[600], FC) + 0.3*5
+    t, _ = left_text("330 ml", T[600], FC, rx - wv, TOP, INK, tracking=0.3); s.append(t)
+    ew = V.natural_w("℮", T[600], e_cap)
+    t, _ = left_text("℮", T[600], e_cap, rx - wv - 1.0 - ew, TOP, INK); s.append(t)
+    # subtitle: fixed tracking, centred, two lines
+    y1 = wm_bottom + 4.2
+    s.append(V.text_block("KRÄUTERSAFTGETRÄNK", T[500], 1.85, CXF, y1, INK, tracking=0.5))
+    s.append(V.text_block("AUS DEM GESÄUSE",     T[500], 1.85, CXF, y1 + 3.2, INK, tracking=0.5))
+
+    # ================= LEFT : EAN | Zutaten =================
+    s.append('<!--LAYER:Zutaten-->')
+    # EAN, ladder orientation, outer edge, top on the grid
+    ean_brand.X = 0.264; ean_brand.BAR_H = 11.0; ean_brand.GUARD_EXT = 1.32
+    ean_brand.TXT_H = 2.2; ean_brand.QL = 11*0.264; ean_brand.QR = 7*0.264
+    full, var, (EW, EH) = ean_brand.build("912004893866")
+    ev = var["ean-%s-vertical" % full]
+    ex, ey = LEFT_X0 + M - 1.5, TOP - CAP_H
+    s.append(f'<g id="ean" inkscape:label="EAN 9120048938668" transform="translate({ex:.3f},{ey:.3f})">{_inner(ev)}</g>')
+    x = ex + EH + 3.0
+    maxw = FRONT_X0 - M - x
+    y = TOP
+    t, _ = left_text("ZUTATEN", T[600], CAP_H, x, y, INK, tracking=0.30); s.append(t)
+    y += BASE*1.5
+    for ln in wrap_text(L.ZUTATEN, T[300], CAP_B*1.1, maxw):
+        t, _ = left_text(ln, T[300], CAP_B, x, y, INK); s.append(t); y += BASE
+    t, _ = left_text(L.BIO_NOTE, T[300], CAP_S, x, y, INK); s.append(t); y += BASE*1.5
+    for h in HINWEISE:
+        for ln in wrap_text(h, T[300], CAP_B*1.1, maxw):
+            t, _ = left_text(ln, T[300], CAP_B, x, y, INK); s.append(t); y += BASE
+    # bottom row: EU leaf (legal min 13.5 x 9) + code + origin + Lacon, bottoms on BOTTOM
+    lw, lh = 13.5, 9.0
+    ly = BOTTOM - lh - 2*BASE - 0.6
+    g, _ = svg_place(EU, x, ly, lw, lh, "eu-leaf"); s.append(g)
+    # code + origin set to exactly the leaf's width (13.5 mm) so the block reads as one unit
+    def fitcap(txt, font, cap0, target):
+        _, w0 = left_text(txt, font, cap0, 0, 0, INK)
+        return cap0 * target / w0
+    cc = fitcap(L.BIO_CODE, T[500], 1.8, lw)
+    co = fitcap(L.BIO_ORIGIN, T[300], CAP_S, lw)
+    yb1 = ly + lh + 1.5 + cc            # 1.5 mm from leaf to the code's cap line
+    yb2 = yb1 + 1.1 + co                # 1.1 mm between the two lines
+    s.append(left_text(L.BIO_CODE,   T[500], cc, x, yb1, INK)[0])
+    s.append(left_text(L.BIO_ORIGIN, T[300], co, x, yb2, INK)[0])
+    # MHD / Los / Pfand beside the leaf, top-aligned with it
+    mx = x + lw + 3.0
+    # MHD + Los: sample values in ink (inkjet at filling replaces them)
+    fy0 = ly + lh/2 - 2.8
+    t, _ = left_text("Mindestens haltbar bis:", T[300], CAP_S, mx, fy0, INK); s.append(t)
+    t, _ = left_text("31.12.2027", T[500], 1.8, mx, fy0 + 2.9, INK); s.append(t)
+    t, _ = left_text("Los: L 2609", T[400], CAP_S, mx, fy0 + 5.4, INK); s.append(t)
+
+    # ================= RIGHT : Nährwerte | Erzeuger | QR + Gesäuse =================
+    s.append('<!--LAYER:Naehrwerte-->')
+    x = FRONT_X1 + M
+    maxw = RIGHT_X1 - M - x
+    y = TOP
+    t, _ = left_text("NÄHRWERTDEKLARATION", T[600], CAP_H, x, y, INK, tracking=0.30); s.append(t)
+    wv = V.natural_w("pro 100 ml", T[300], CAP_B)
+    t, _ = left_text("pro 100 ml", T[300], CAP_B, x + maxw - wv, y, INK); s.append(t)
+    y += BASE*0.6
+    rule = lambda yy: (f'<line inkscape:label="Linie Nährwerttabelle" x1="{x:.2f}" y1="{yy:.2f}" x2="{x+maxw:.2f}" y2="{yy:.2f}" '
+                       f'stroke="{INK}" stroke-width="0.25"/>')
+    s.append(rule(y)); y += BASE*1.1
+    for name, val, indent in NAEHRWERT:
+        nf = T[300] if indent else T[400]
+        t, _ = left_text(name, nf, CAP_B, x + (2.4 if indent else 0), y, INK); s.append(t)
+        vw = V.natural_w(val, T[400], CAP_B)
+        t, _ = left_text(val, T[400], CAP_B, x + maxw - vw, y, INK); s.append(t)
+        y += BASE
+    y -= BASE*0.4
+    s.append(rule(y)); y += BASE*1.4
+    addr = ["Sandra Stangl", "T: 0664/73839445", "Lainbach 25, 8921 Landl"]
+    y0 = y
+    for ln in addr:
+        t, _ = left_text(ln, T[300], CAP_B, x, y, INK); s.append(t); y += BASE
+    # marks row: VEGAN + OHNE KOFFEIN + Gesäuse Partner, right-aligned, centred on the address block
+    d = 9.4; mgap = 1.0
+    cy_m = y0 - CAP_B/2 + BASE
+    ry = cy_m - d/2
+    mx0 = x + maxw - 3*d - 2*mgap
+    for i, nm in enumerate(("vegan", "ohne-koffein", "hofproduktion")):
+        s.append(img(f"art/marks/mark-{nm}.png", mx0 + i*(d+mgap), ry, d, d, f"marke-{nm}"))
+    # bottom row: QR (10 mm) + Gesäuse Partner, bottoms on BOTTOM
+    s.append('<!--LAYER:Codes-->')
+    qs = 9.0
+    q = qr_brand.svg(qr_brand.matrix(qr_brand.URL), style="rounded", centre=True, quiet=0)
+    n = int(re.search(r'viewBox="0 0 (\d+)', q).group(1))
+    s.append(f'<g id="qr" inkscape:label="QR kraeuterbergbauer.at" transform="translate({x:.3f},{BOTTOM-qs:.3f}) scale({qs/n:.5f})">{_inner(q)}</g>')
+    sy = BOTTOM - qs + (qs - (2*BASE + 0.3 + CAP_B))/2 + CAP_B   # 3-line block centred on the QR
+    for i, ln in enumerate(STORY):
+        t, _ = left_text(ln, T[400], CAP_B, x + qs + 2.5, sy + i*BASE, INK); s.append(t)
+    gw = 11.5
+    g, gh = svg_place(GS, x + maxw - gw, BOTTOM - qs/2 - gw*508/809/2, gw, None, "gesaeuse-partner"); s.append(g)
+    ux, uy = x + qs + 2.5, sy + 2*BASE + 0.3
+    # small arrow pointing left at the QR
+    ay = uy - CAP_B*0.5
+    s.append(f'<path inkscape:label="Pfeil zum QR" d="M{ux+2.2:.2f},{ay:.2f} H{ux+0.3:.2f} M{ux+0.9:.2f},{ay-0.6:.2f} L{ux+0.25:.2f},{ay:.2f} L{ux+0.9:.2f},{ay+0.6:.2f}" '
+             f'fill="none" stroke="{INK}" stroke-width="0.25" stroke-linecap="round" stroke-linejoin="round"/>')
+    t, _ = left_text("kraeuterbergbauer.at", T[600], CAP_B, ux + 3.4, uy, INK); s.append(t)
+    s.append("</svg>")
+    return "".join(s)
+
+def render(stem, bg_png=None, png_w=2200):
+    import cairosvg
+    svg = build(bg_png)
+    open(stem + ".svg", "w", encoding="utf-8").write(svg)
+    cairosvg.svg2png(bytestring=svg.encode(), write_to=stem + ".png", output_width=png_w)
+    return svg
+
+if __name__ == "__main__":
+    import sys
+    render("out/v2", "/mnt/user-data/outputs/xeistee-band/backgrounds/bg-13-glow-gold-4k.png")
