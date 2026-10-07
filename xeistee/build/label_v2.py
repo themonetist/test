@@ -379,10 +379,11 @@ def build(bg_png=None):
         s.append(svg_place_visual(GS, x, (qy + BOTTOM)/2 - vh/2, vw, "gesaeuse-partner", fill=INK))
         x_qr = x + maxw - qs
     elif GS_MODE == 'qr-text':
-        # Story wieder da, Text + URL so klein wie noetig, damit das Siegel 8 mm breit bleibt
-        vw = 8.0
-        aw = tw - vw - 2.5
-        sc = min(CAP_V, CAP_V * aw / max(V.natural_w(st, T[400], CAP_V) for st in STORY))
+        # Story wieder da, kleiner; QR 7,5 mm (Modul 0,227 mm, nicht kleiner);
+        # das Siegel bekommt die ganze Restbreite
+        qs = 7.5; qy = BOTTOM - qs; tx = x + qs + 2.2
+        sc = 1.18                                    # Untergrenze freiwilliger Text
+        aw = max(V.natural_w(st, T[400], sc) for st in STORY)
         uc = min(CAP_B, CAP_B * (aw - 3.4) / V.natural_w(URL, T[600], CAP_B))
         lead = BASE*0.92*sc/CAP_V
         blk = len(STORY)*lead + 0.3 + uc
@@ -392,8 +393,9 @@ def build(bg_png=None):
         uy = sy + len(STORY)*lead + 0.3
         arrow(uy - uc*0.5)
         s.append(left_text(URL, T[600], uc, tx + 3.4, uy, INK)[0])
-        gesaeuse(vw, BOTTOM - qs/2)
-        print(f"  Story {sc:.2f} mm, URL {uc:.2f} mm")
+        vw = maxw - qs - 2.2 - aw - 2.2
+        vh = gesaeuse(vw, BOTTOM - qs/2)
+        print(f"  QR {qs:.2f} mm, Story {sc:.2f} mm, URL {uc:.2f} mm, Siegel {vw:.2f} x {vh:.2f} mm")
     elif GS_MODE == 'qr':
         # ohne Story, URL mittig zum QR, Siegel rechts buendig in derselben Reihe
         uc = CAP_V

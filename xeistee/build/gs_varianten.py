@@ -5,11 +5,7 @@ from PIL import Image, ImageDraw, ImageFont
 import fmt, label_v2 as L
 
 OUT = "out/gesaeuse-varianten/"
-VARIANTEN = [("E", "qr",        "QR | URL | Gesaeuse (vorher)"),
-             ("F", "qr-unter",  "URL unter dem QR, Gesaeuse rechts"),
-             ("G", "qr-text",   "Story wieder da, kleiner, Gesaeuse rechts"),
-             ("H", "qr-breit",  "QR groesser, URL darunter gleich breit"),
-             ("I", "qr-rechts", "gespiegelt: Gesaeuse links, QR + URL rechts")]
+VARIANTEN = [("G", "qr-text",   "QR 7,5 | Story + URL kleiner | Gesaeuse groesser")]
 
 def run():
     os.makedirs(OUT, exist_ok=True)
